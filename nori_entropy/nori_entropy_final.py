@@ -1,17 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-nori_onepass_unified.py
-UIはFace Shannon-onlyそのまま。内部で Face と AV Shannon+ を同時計算し、
-信頼度で自動ブレンドして Still* を出力（モード分割なし）。
-矢印：枠外=水色 / 枠内=薄い青
+nori_onepass_unified.py (A-driven tuning edition)
+- A(意識)で Temperature T を直接チューニング
+- A で Face/AV ブレンド比を動的バイアス
+- 既存のヒステリシス可変はそのまま
 
 依存:
   - opencv-python, numpy
   - (任意) sounddevice  … 音声も使う場合
   - (任意) torch        … USE_TORCH=True のときのみ
-
-起動例:
-  python nori_onepass_unified.py
 """
 
 import cv2 as cv
@@ -21,8 +18,8 @@ from collections import deque
 
 # ===== 設定フラグ =====
 HUD_POPUP  = True    # True=バーは別ウィンドウ / False=メイン映像に重ねる
-USE_AUDIO  = True   # 重いなら False 推奨
-USE_TORCH  = True   # 無意識(Torch)を使うか。False だと超軽量の意識のみ
+USE_AUDIO  = True    # 重いなら False 推奨
+USE_TORCH  = True    # 無意識(Torch)を使うか。False だと超軽量の意識のみ
 
 # ===== Awareness Engine の選択 =====
 if USE_TORCH:
@@ -66,7 +63,7 @@ except Exception:
 
 audio_q = queue.Queue()
 audio_stream = None
-AUDIO_OK = True
+AUDIO_OK = True  # start_audioで更新
 
 def audio_callback(indata, frames, time_info, status):
     if indata is None or len(indata)==0: return
@@ -304,12 +301,13 @@ def main():
         still_av = 1.0 - fused_av
         c_av = 1.0 if H_audio_ema is not None else 0.6  # 音声が取れてれば高信頼
 
-        # ---- 自動ブレンド（UIはFaceのまま）----
+        # ---- 一旦の自動ブレンド ----
         s = c_face + c_av
         if s <= 1e-6:
             still = still_face
             wf, wa = 1.0, 0.0
         else:
+            # まずは信頼度に比例
             wf, wa = c_face/s, c_av/s
             still = float(np.clip(wf*still_face + wa*still_av, 0, 1))
 
@@ -318,14 +316,34 @@ def main():
             f_motion, f_eyedir, f_blink, f_mouth, f_tong,
             f_video, (f_audio if H_audio_ema is not None else 0.5)
         ], dtype=np.float32)
-        A, T_base = engine.step(feat)
+        A, T_attn = engine.step(feat)  # T_attnはTorch時のみ意味あり（Fastでは1.0）
 
-        # ---- FPS / T 調整（Torch使用時のみ意味あり） ----
+        # ---- A主導の Temperature（無意識の広がり） ----
+        T_min, T_max = 0.7, 1.6
+        T_from_A = T_min + (1.0 - A) * (T_max - T_min)
+        # Torchを使うなら Attn由来のTとブレンド。使わないならA由来のみ。
+        if USE_TORCH:
+            T = 0.5*T_attn + 0.5*T_from_A
+        else:
+            T = T_from_A
+
+        # ---- FPS による T の安全弁（Torch時のみ軽減） ----
         now = time.time()
         dt = now - last_time; last_time = now
         fps = 1.0 / max(dt, 1e-6)
         fps_ema = fps_alpha * fps + (1 - fps_alpha) * fps_ema
-        T = T_base * (max(0.5, fps_ema / fps_target) if USE_TORCH and fps_ema < fps_target else 1.0)
+        if USE_TORCH and fps_ema < fps_target:
+            T *= max(0.5, fps_ema / fps_target)  # 重いときはTを下げて集中寄せ
+
+        # ---- Aで Face/AV ブレンドを再バイアス（意識主導） ----
+        # 集中(A↑)でFace重視、俯瞰(A↓)でAV重視。softmax風の正規化。
+        beta_face = 1.0 + 1.5*A
+        beta_av   = 1.0 + 1.5*(1.0 - A)
+        w_face = np.exp(beta_face * (c_face + 1e-6))
+        w_av   = np.exp(beta_av   * (c_av   + 1e-6))
+        wf = w_face / (w_face + w_av)
+        wa = 1.0 - wf
+        still = float(np.clip(wf*still_face + wa*still_av, 0, 1))
 
         # ---- ヒステリシス閾値をAで可変化 ----
         enter = np.clip(CFG["enter"] * (0.8 + 0.4*A), 0.1, 0.9)
