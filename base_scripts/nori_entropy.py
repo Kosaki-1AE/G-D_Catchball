@@ -299,6 +299,11 @@ def main():
         else:
             wf, wa = c_face/s, c_av/s
             still = float(np.clip(wf*still_face + wa*still_av, 0, 1))
+                # --- Nori: 映像/音声のShannon系特徴から A(意識) と T(温度) を推定 ---
+        feat = np.array([
+            f_motion, f_eyedir, f_blink, f_mouth, f_tong,
+            f_video, (f_audio if H_audio_ema is not None else 0.5)
+        ], dtype=np.float32)
 
         # ---- 滞留＋ヒステリシス（enter/exit/dwell は固定。必要なら自動調整も可）----
         gate_text = ""
@@ -307,14 +312,14 @@ def main():
             state="MOTION"; still_counter=0; gate_text=f"GATED {refractory}"
         else:
             if state=="MOTION":
-                if still > (1.0 - CFG["enter"]):
+                if still > 1.0:
                     still_counter += 1
                     if still_counter >= CFG["dwell"]:
                         state="STILL"; still_counter=0
                 else:
                     still_counter=0
             else:
-                if still < (1.0 - CFG["exit"]):
+                if still < 1.0:
                     state="MOTION"
 
         # ===== UI（Face版そのまま）=====
