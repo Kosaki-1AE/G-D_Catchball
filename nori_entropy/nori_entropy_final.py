@@ -18,11 +18,19 @@ import cv2 as cv
 import time, sys, queue, random
 import numpy as np
 from collections import deque
+from log_manager import RingStats, CsvLogger, SessionMemory, Tick
 
 # ===== 設定フラグ =====
 HUD_POPUP  = True
 USE_AUDIO  = True
 USE_TORCH  = True  # 無意識ON/OFF
+SHOW_TEXT  = False
+LOG_ENABLE = True   # ログON/OFF
+hist  = RingStats(maxlen=300)                          # 約10〜15秒ぶん
+slog  = CsvLogger(enabled=LOG_ENABLE)                  # 1秒ごとCSV
+smem  = SessionMemory().load()                         # 前回の傾向を取得
+C_GAIN = 1.6   # 意識側の増幅係数
+U_DAMP = 0.6   # 無意識側の減衰係数（0～1）
 
 # ===== Awareness Engine の選択 =====
 if USE_TORCH:
@@ -194,17 +202,67 @@ class IntentEngine:
 
 # ===== Main =====
 def main():
+    # smem から初期値ブートストラップ（好みで重み）
+    A_bias = float(smem.get("boot_A", 0.5)) * 0.2          # 初期Aに混ぜる率
+    I_init = float(smem.get("boot_I", 0.3))
+    ENTER_SCALE = float(smem.get("enter_scale", 1.0))
+    EXIT_SCALE  = float(smem.get("exit_scale", 1.0))
+    EPS_SCALE   = float(smem.get("eps_scale", 1.0))
+    DEAD_SCALE  = float(smem.get("deadzone_scale", 1.0))
+
     cap = cv.VideoCapture(0)
     assert cap.isOpened(), "camera open failed"
     start_audio(CFG["sr"], CFG["blocksize"], CFG["audio_device"])
 
     aware = AwarenessEngine(feat_dim=7, **({} if not USE_TORCH else {"seq_len": 32}))
-    intent = IntentEngine(feat_dim=7)
+    intent = IntentEngine(feat_dim=7) 
+
+    # --- ポリシー選択（= 意識の決定） ---
+    policy, p_face = intent.choose_policy(score_face, score_av, A, T)
+    p_av = 1.0 - p_face
+
+    # 意識/無意識のラベル
+    conscious   = policy                               # "FACE" or "AV"
+    unconscious = "AV" if policy == "FACE" else "FACE"
+
+    # （任意）無意識がAVのときは音声の計算頻度を半分に落とす
+    do_audio = True
+    if (unconscious == "AV") and (frame_idx & 1):      # 奇数フレームはスキップ
+        do_audio = False
+
+    # --- 意識/無意識ゲイン ---
+    # A(意識)とI(意思)から“決断の強さ”を 0..1 にまとめる
+    alpha = 0.6 * A + 0.4 * float(intent.I)
+
+    # 意識側をブースト、無意識側を減衰
+    G_CONSC     = 1.2      # 意識側の増幅係数
+    G_UNCON_DMP = 0.8      # 無意識側の減衰係数
+    MIN_UNCON   = 0.15     # 無意識側の下限（完全ゼロは避ける）
+
+    if policy == "FACE":
+        g_face = 1.0 + G_CONSC * alpha
+        g_av   = max(MIN_UNCON, 1.0 - G_UNCON_DMP * alpha)
+    else:  # policy == "AV"
+        g_av   = 1.0 + G_CONSC * alpha
+        g_face = max(MIN_UNCON, 1.0 - G_UNCON_DMP * alpha)
+
+    # --- ブレンド重みを再正規化して適用 ---
+    # まず信頼度だけで計算した基準重み（wf0, wa0）がある想定
+    wf = max(1e-6, wf0) * g_face
+    wa = max(1e-6, wa0) * g_av
+    s  = wf + wa
+    wf, wa = wf / s, wa / s
+
+    still = float(np.clip(wf * still_face + wa * still_av, 0.0, 1.0))
+
+
+    intent.I = I_init                                      # 意思の初期値
 
     bg = cv.createBackgroundSubtractorMOG2(history=300, varThreshold=16, detectShadows=True)
     refractory = 0; prev_fg=None; prev_luma=None
     prev_gray=None
 
+    # frame_idx = 0                                          #ここにこれ入ってると記憶喪失状態になるっぽい
     H_motion_ema=None; H_eye_dir_ema=None; H_blink_prev=None
     blink_hist = deque(maxlen=15)
     H_video_ema=None; H_audio_ema=None
@@ -346,6 +404,20 @@ def main():
         fps_ema = fps_alpha * fps + (1 - fps_alpha) * fps_ema
         if USE_TORCH and fps_ema < fps_target:
             T *= max(0.5, fps_ema / fps_target)
+        
+        # ---- ログへpush（短期） ----
+        hist.push(dict(A=A, T=T, I=float(intent.I), pol=policy, state=state,
+                    still=still, fps=fps_ema,
+                    f_motion=f_motion, f_eyedir=f_eyedir, f_blink=f_blink,
+                    f_mouth=f_mouth, f_tong=f_tong))
+
+        # ---- 1秒ごとCSV追記 ----
+        slog.maybe_write(Tick(
+            t=time.time(), A=A, T=T, I=float(intent.I), pol=policy, state=state,
+            still=still, fps=fps_ema,
+            f_motion=f_motion, f_eyedir=f_eyedir, f_blink=f_blink,
+            f_mouth=f_mouth, f_tong=f_tong
+        ))
 
         # === Intent policy 選択 ===
         # preferenceに基づく追加スコア（自分の“好み”）
@@ -369,6 +441,17 @@ def main():
         # === ヒステリシス（AとIで可変） ===
         enter = np.clip(CFG["enter"] * (0.75 + 0.5*A + 0.25*intent.I), 0.1, 0.95)
         exit_  = np.clip(CFG["exit"]  * (1.25 - 0.5*A - 0.25*intent.I), 0.05, 0.9)
+        enter *= ENTER_SCALE
+        exit_  *= EXIT_SCALE
+        
+        # IntentEngine.choose_policy 内の一部（擬似コード）
+        eps = 0.15 * (1.0 - self.I) * (1.0 - A)
+        eps *= EPS_SCALE   # ←再参照補正
+        dead = CFG["flow_deadzone"] * (0.8 + 0.4*intent.I) * DEAD_SCALE
+        mag[mag < dead] = 0.0
+        if frame_idx < 30:   # 最初の約1秒だけ
+            A = float( (1.0-0.2)*A + 0.2*A_bias )
+
 
         gate_text = ""
         good_event = False
@@ -399,11 +482,14 @@ def main():
                 intent.reinforce(feat, policy, good=False)
 
         # ===== UI =====
-        cv.putText(frame, f"STATE:{state}  POL:{policy}", (18,26), cv.FONT_HERSHEY_SIMPLEX, 0.7,(0,255,255),2, cv.LINE_AA)
-        cv.putText(frame, f"A:{A:.2f}  T:{T:.2f}  I:{intent.I:.2f}  FPS:{fps_ema:.1f}", (18,50),
-                   cv.FONT_HERSHEY_SIMPLEX, 0.6,(255,255,0),2, cv.LINE_AA)
-        if gate_text:
-            cv.putText(frame, gate_text, (18,72), cv.FONT_HERSHEY_SIMPLEX, 0.6,(0,255,255),2)
+        if SHOW_TEXT:
+            cv.putText(frame, f"STATE:{state}  POL:{policy}", (18,26),
+                    cv.FONT_HERSHEY_SIMPLEX, 0.7,(0,255,255),2, cv.LINE_AA)
+            cv.putText(frame, f"A:{A:.2f}  T:{T:.2f}  FPS:{fps_ema:.1f}", (18,50),
+                    cv.FONT_HERSHEY_SIMPLEX, 0.6,(255,255,0),2, cv.LINE_AA)
+            if gate_text:
+                cv.putText(frame, gate_text, (18,72),
+                        cv.FONT_HERSHEY_SIMPLEX, 0.6,(0,255,255),2, cv.LINE_AA)
 
         if HUD_POPUP:
             show_hud(dict(
@@ -417,7 +503,6 @@ def main():
             draw_bar(frame, 150, "f_mouth ", f_mouth, (120,180,255))
             draw_bar(frame, 170, "f_tong  ", f_tong,  (180,120,255))
             draw_bar(frame, 190, "Still*",  still,    (0,255,255))
-
         # 矢印
         step=32
         gh, gw = grayb.shape
@@ -431,12 +516,24 @@ def main():
         prev_gray = grayb
         if cv.waitKey(1) & 0xFF in (27, ord('q')):
             break
+    
+    # === 終了処理 ===
+    try:
+        sm = SessionMemory()           # 新規で開いてOK
+        sm.load()
+        sm.update_from_hist(hist)      # 直近ヒストリーから補正値を学習
+        sm.save()
+    except Exception as e:
+        print("[WARN] session save failed:", e)
+
+    slog.close()
 
     try: cap.release()
     except: pass
     try:
         if audio_stream is not None: audio_stream.stop(); audio_stream.close()
     except: pass
+    frame_idx += 1
     cv.destroyAllWindows()
     print("[INFO] Bye.")
 
